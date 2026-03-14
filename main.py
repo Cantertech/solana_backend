@@ -3,7 +3,7 @@ import logging
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import asyncio
@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from PIL import Image, ImageDraw, ImageFont
 import requests
 import io
+import json
 
 # Initialize logging and FastApi
 logging.basicConfig(level=logging.INFO)
@@ -107,48 +108,51 @@ HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
 PPP_MINT_ADDRESS = os.getenv("PPP_MINT_ADDRESS", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 
 async def run_dune_query(query_sql: str):
-    """Executes a Dune SQL query and waits for results."""
-    logger.info("--- STARTING DUNE QUERY ENGIN ---")
-    logger.debug(f"Executing SQL: {query_sql}")
+    """Executes a Dune SQL query and yields progress logs."""
+    yield {"type": "log", "message": "--- STARTING DUNE QUERY ENGINE ---"}
     if not DUNE_API_KEY:
-        logger.error("DUNE_API_KEY is missing! Cannot run query.")
-        return None
+        yield {"type": "log", "message": "DUNE_API_KEY is missing! Cannot run query."}
+        yield {"type": "result", "data": None}
+        return
         
     headers = {"X-Dune-API-Key": DUNE_API_KEY}
     try:
-        logger.info("Sending query to Dune API...")
+        yield {"type": "log", "message": "Sending query to Dune API..."}
         execute_res = requests.post("https://api.dune.com/api/v1/query/execute", headers=headers, json={"query_sql": query_sql})
         
         if execute_res.status_code != 200:
-            logger.error(f"Dune API returned error code {execute_res.status_code}: {execute_res.text}")
-            return None
+            yield {"type": "log", "message": f"Dune API returned error code {execute_res.status_code}: {execute_res.text}"}
+            yield {"type": "result", "data": None}
+            return
             
         execution_id = execute_res.json().get("execution_id")
         if not execution_id: 
-            logger.error("Dune returned success but no execution_id.")
-            return None
+            yield {"type": "log", "message": "Dune returned success but no execution_id."}
+            yield {"type": "result", "data": None}
+            return
             
-        logger.info(f"Query accepted by Dune. Execution ID: {execution_id}. Polling for results...")
+        yield {"type": "log", "message": f"Query accepted by Dune. Execution ID: {execution_id}. Polling for results..."}
         
         for i in range(15):
             await asyncio.sleep(2)
-            logger.info(f"Polling Dune... (Attempt {i+1}/15)")
+            yield {"type": "log", "message": f"Polling Dune... (Attempt {i+1}/15)"}
             status_res = requests.get(f"https://api.dune.com/api/v1/execution/{execution_id}/results", headers=headers)
             data = status_res.json()
             state = data.get("state")
             
-            logger.info(f"Dune query state: {state}")
+            yield {"type": "log", "message": f"Dune query state: {state}"}
             if state == "QUERY_STATE_COMPLETED": 
                 rows = data.get("result", {}).get("rows", [])
-                logger.info(f"Dune returned {len(rows)} result rows successfully.")
-                logger.debug(f"Raw Row Data: {rows}")
-                return rows
+                yield {"type": "log", "message": f"Dune returned {len(rows)} result rows successfully."}
+                yield {"type": "result", "data": rows}
+                return
             if state in ["QUERY_STATE_FAILED", "QUERY_STATE_CANCELLED"]: 
-                logger.error(f"Dune Query Failed on server: {data}")
-                return None
+                yield {"type": "log", "message": f"Dune Query Failed on server: {data}"}
+                yield {"type": "result", "data": None}
+                return
     except Exception as e: 
-        logger.error(f"Local Exception during Dune API execution: {e}")
-    return None
+        yield {"type": "log", "message": f"Local Exception during Dune API execution: {e}"}
+    yield {"type": "result", "data": None}
 
 async def is_ppp_holder(wallet_address: str) -> bool:
     """Checks if the user holds $PPP tokens using Helius DAS API."""
@@ -175,104 +179,130 @@ async def is_ppp_holder(wallet_address: str) -> bool:
 
 @app.post("/api/sync-history/{wallet_address}")
 async def sync_historical_data(wallet_address: str):
-    """Deep Scan: Tries Dune (Lifetime) -> Fallback to Helius (Recent) + Holder Check"""
-    logger.info(f"Starting Multi-Layer Sync for {wallet_address}...")
+    """Deep Scan: Streams logs back to frontend while processing."""
     
-    # 1. Dune Query (Comprehensive History - Total Ecosystem Volume)
-    dune_sql = f"""
-    WITH swaps AS (
-        SELECT 'PPP_Volume' as metric, SUM(amount_usd) as val
-        FROM jupiter_solana.aggregator_swaps
-        WHERE trader_id = '{wallet_address}'
-    ),
-    perps AS (
-        SELECT 'Perps' as metric, SUM(amount_usd) as val
-        FROM jupiter_perps_solana.trades
-        WHERE trader = '{wallet_address}'
-    ),
-    dca AS (
-        SELECT 'DCA' as metric, SUM(amount_usd) as val
-        FROM jupiter_solana.aggregator_swaps
-        WHERE trader_id = '{wallet_address}'
-        AND (description LIKE '%DCA%' OR lower(source) LIKE '%dca%')
-    ),
-    staking AS (
-        SELECT 'Jup_Staked' as metric, SUM(amount) / 1e6 as val
-        FROM jupiter_solana.voting_locker_deposits
-        WHERE owner = '{wallet_address}'
-    ),
-    lend AS (
-        SELECT 'Jup_Lend' as metric, SUM(amount_usd) as val
-        FROM kamino_solana.deposits
-        WHERE owner = '{wallet_address}'
-    )
-    SELECT * FROM swaps 
-    UNION ALL SELECT * FROM perps 
-    UNION ALL SELECT * FROM dca
-    UNION ALL SELECT * FROM staking
-    UNION ALL SELECT * FROM lend
-    """
-    
-    dune_results = await run_dune_query(dune_sql)
-    
-    real_metrics = {"DCA": 0.0, "Perps": 0.0, "Jup_Lend": 0.0, "Limit_Orders": 0.0, "PPP_Volume": 0.0, "Jup_Staked": 0.0}
+    async def event_generator():
+        def log(msg):
+            return json.dumps({"type": "log", "message": msg}) + "\n"
 
-    if dune_results:
-        for row in dune_results:
-            m_type, m_val = row.get("metric"), float(row.get("val") or 0.0)
-            if m_type in real_metrics: real_metrics[m_type] = m_val
-        logger.info(f"Dune Scan Successful: {real_metrics}")
-    else:
-        logger.warning("Dune unavailable. Running Helius Early-Response Scan.")
-        return await sync_via_helius(wallet_address)
+        yield log(f"Starting Multi-Layer Sync for {wallet_address}...")
+        
+        dune_sql = f"""
+        WITH swaps AS (
+            SELECT 'PPP_Volume' as metric, SUM(amount_usd) as val
+            FROM jupiter_solana.aggregator_swaps
+            WHERE trader_id = '{wallet_address}'
+        ),
+        perps AS (
+            SELECT 'Perps' as metric, SUM(amount_usd) as val
+            FROM jupiter_perps_solana.trades
+            WHERE trader = '{wallet_address}'
+        ),
+        dca AS (
+            SELECT 'DCA' as metric, SUM(amount_usd) as val
+            FROM jupiter_solana.aggregator_swaps
+            WHERE trader_id = '{wallet_address}'
+            AND (description LIKE '%DCA%' OR lower(source) LIKE '%dca%')
+        ),
+        staking AS (
+            SELECT 'Jup_Staked' as metric, SUM(amount) / 1e6 as val
+            FROM jupiter_solana.voting_locker_deposits
+            WHERE owner = '{wallet_address}'
+        ),
+        lend AS (
+            SELECT 'Jup_Lend' as metric, SUM(amount_usd) as val
+            FROM kamino_solana.deposits
+            WHERE owner = '{wallet_address}'
+        )
+        SELECT * FROM swaps 
+        UNION ALL SELECT * FROM perps 
+        UNION ALL SELECT * FROM dca
+        UNION ALL SELECT * FROM staking
+        UNION ALL SELECT * FROM lend
+        """
+        
+        dune_results = None
+        async for chunk in run_dune_query(dune_sql):
+            if chunk["type"] == "log":
+                yield log(chunk["message"])
+            elif chunk["type"] == "result":
+                dune_results = chunk["data"]
+        
+        real_metrics = {"DCA": 0.0, "Perps": 0.0, "Jup_Lend": 0.0, "Limit_Orders": 0.0, "PPP_Volume": 0.0, "Jup_Staked": 0.0}
 
-    is_holder = await is_ppp_holder(wallet_address)
-    multiplier = 1.5 if is_holder else 1.0
-    
-    # Update Supabase
-    if SUPABASE_URL and SUPABASE_SERVICE_KEY:
-        total_base_points = 0
-        for m_type, m_val in real_metrics.items():
-            metric_points = int(m_val / 10)
-            total_base_points += metric_points
-            try:
-                supabase.table("user_metrics").upsert({
-                    "wallet_address": wallet_address,
-                    "metric_type": m_type,
-                    "metric_value": round(m_val, 2),
-                    "calculated_aura_points": metric_points
-                }, on_conflict="wallet_address,metric_type").execute()
-            except Exception as e: logger.error(f"Supabase Error: {e}")
+        if dune_results is not None:
+            for row in dune_results:
+                m_type, m_val = row.get("metric"), float(row.get("val") or 0.0)
+                if m_type in real_metrics: real_metrics[m_type] = m_val
+            yield log(f"Dune Scan Successful. Volume tracked.")
+            
+            yield log("Checking if wallet is a $PPP holder for multiplier boost...")
+            is_holder = await is_ppp_holder(wallet_address)
+            multiplier = 1.5 if is_holder else 1.0
+            
+            if is_holder:
+                yield log("Status: Verified $PPP Holder. Applying 1.5x Aura Point Boost!")
+            else:
+                yield log("Status: Not currently holding $PPP.")
+            
+            yield log("Syncing backend databases...")
+            if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+                total_base_points = 0
+                for m_type, m_val in real_metrics.items():
+                    metric_points = int(m_val / 10)
+                    total_base_points += metric_points
+                    try:
+                        supabase.table("user_metrics").upsert({
+                            "wallet_address": wallet_address,
+                            "metric_type": m_type,
+                            "metric_value": round(m_val, 2),
+                            "calculated_aura_points": metric_points
+                        }, on_conflict="wallet_address,metric_type").execute()
+                    except Exception as e:
+                        logger.error(f"Supabase Error: {e}")
 
-        # Final Aura Aggregation
-        try:
-            supabase.table("user_aura_points").upsert({
-                "wallet_address": wallet_address,
-                "base_points": total_base_points,
-                "multipliers": multiplier,
-                "total_points": int(total_base_points * multiplier)
-            }, on_conflict="wallet_address").execute()
-        except Exception as e: logger.error(f"Aura Upsert Error: {e}")
+                try:
+                    supabase.table("user_aura_points").upsert({
+                        "wallet_address": wallet_address,
+                        "base_points": total_base_points,
+                        "multipliers": multiplier,
+                        "total_points": int(total_base_points * multiplier)
+                    }, on_conflict="wallet_address").execute()
+                except Exception as e:
+                    logger.error(f"Aura Upsert Error: {e}")
 
-    return {"status": "success", "source": "Dune", "metrics": real_metrics, "is_holder": is_holder}
+            yield log("Deep Scan execution finished successfully.")
+            yield json.dumps({"type": "result", "data": {"status": "success", "source": "Dune", "metrics": real_metrics, "is_holder": is_holder}}) + "\n"
+        else:
+            yield log("Dune unavailable or returned an error. Falling back to fast Helius RPC scanning...")
+            async for chunk in sync_via_helius_stream(wallet_address):
+                if chunk["type"] == "log":
+                    yield log(chunk["message"])
+                elif chunk["type"] == "result":
+                    yield json.dumps({"type": "result", "data": chunk["data"]}) + "\n"
 
-async def sync_via_helius(wallet_address: str):
+    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+
+async def sync_via_helius_stream(wallet_address: str):
     """Fallback: Scans last 100 enriched transactions via Helius + Holder Check"""
-    logger.info("--- STARTING HELIUS RPC FALLBACK ---")
+    yield {"type": "log", "message": "--- STARTING HELIUS RPC FALLBACK ---"}
     if not HELIUS_API_KEY: 
-        logger.warning("No Helius API key, resorting to basic RPC.")
-        return await basic_rpc_scan(wallet_address)
+        yield {"type": "log", "message": "No Helius API key, resorting to basic RPC."}
+        res = await basic_rpc_scan(wallet_address)
+        yield {"type": "result", "data": res}
+        return
     
     url = f"https://api.helius.xyz/v0/addresses/{wallet_address}/transactions?api-key={HELIUS_API_KEY}"
     try:
-        logger.info(f"Fetching txs from Helius: {url}")
+        yield {"type": "log", "message": f"Fetching recent history from Helius API..."}
         res = requests.get(url)
         if res.status_code != 200:
-            logger.error(f"Helius returned status {res.status_code}: {res.text}")
-            return {"status": "error", "message": "Helius scan failed"}
+            yield {"type": "log", "message": f"Helius returned status error: {res.status_code}"}
+            yield {"type": "result", "data": {"status": "error", "message": "Helius scan failed"}}
+            return
             
         txs = res.json()
-        logger.info(f"Helius returned {len(txs)} enriched transactions.")
+        yield {"type": "log", "message": f"Helius loaded {len(txs)} enriched transactions."}
         
         metrics = {"DCA": 0.0, "Perps": 0.0, "Jup_Lend": 0.0, "Limit_Orders": 0.0, "PPP_Volume": 0.0, "Jup_Staked": 0.0}
         for tx in txs:
@@ -284,10 +314,18 @@ async def sync_via_helius(wallet_address: str):
                 for t in tx.get("tokenTransfers", []):
                     if t.get("fromUserAccount") == wallet_address: metrics["PPP_Volume"] += t.get("tokenAmount", 0)
         
-        logger.info(f"Metrics mapped from Helius: {metrics}")
+        yield {"type": "log", "message": f"Helius Scan metrics successful"}
+        yield {"type": "log", "message": "Checking if wallet is a $PPP holder..."}
         
         is_holder = await is_ppp_holder(wallet_address)
         multiplier = 1.5 if is_holder else 1.0
+        
+        if is_holder:
+            yield {"type": "log", "message": "Status: Verified $PPP Holder. Applying 1.5x Boost!"}
+        else:
+            yield {"type": "log", "message": "Status: Not currently holding $PPP."}
+            
+        yield {"type": "log", "message": "Writing fallback metrics to Subapase UI..."}
         
         total_base_points = 0
         for m_type, m_val in metrics.items():
@@ -304,10 +342,11 @@ async def sync_via_helius(wallet_address: str):
             "multipliers": multiplier, "total_points": int(total_base_points * multiplier)
         }, on_conflict="wallet_address").execute()
         
-        return {"status": "success", "source": "Helius Fallback", "metrics": metrics, "is_holder": is_holder}
+        yield {"type": "log", "message": "Fallback Complete."}
+        yield {"type": "result", "data": {"status": "success", "source": "Helius Fallback", "metrics": metrics, "is_holder": is_holder}}
     except Exception as e:
-        logger.error(f"Helius Fallback Error: {e}")
-        return {"status": "error", "message": "Deep scan sources exhausted"}
+        yield {"type": "log", "message": f"Helius Fallback Error: {e}"}
+        yield {"type": "result", "data": {"status": "error", "message": "Deep scan sources exhausted"}}
 
 async def basic_rpc_scan(wallet_address: str):
     """Fallback if Helius key is missing"""
