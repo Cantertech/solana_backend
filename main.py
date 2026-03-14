@@ -108,20 +108,46 @@ PPP_MINT_ADDRESS = os.getenv("PPP_MINT_ADDRESS", "EPjFWdd5AufqSSqeM2qN1xzybapC8G
 
 async def run_dune_query(query_sql: str):
     """Executes a Dune SQL query and waits for results."""
+    logger.info("--- STARTING DUNE QUERY ENGIN ---")
+    logger.debug(f"Executing SQL: {query_sql}")
     if not DUNE_API_KEY:
+        logger.error("DUNE_API_KEY is missing! Cannot run query.")
         return None
+        
     headers = {"X-Dune-API-Key": DUNE_API_KEY}
     try:
+        logger.info("Sending query to Dune API...")
         execute_res = requests.post("https://api.dune.com/api/v1/query/execute", headers=headers, json={"query_sql": query_sql})
+        
+        if execute_res.status_code != 200:
+            logger.error(f"Dune API returned error code {execute_res.status_code}: {execute_res.text}")
+            return None
+            
         execution_id = execute_res.json().get("execution_id")
-        if not execution_id: return None
-        for _ in range(15):
+        if not execution_id: 
+            logger.error("Dune returned success but no execution_id.")
+            return None
+            
+        logger.info(f"Query accepted by Dune. Execution ID: {execution_id}. Polling for results...")
+        
+        for i in range(15):
             await asyncio.sleep(2)
+            logger.info(f"Polling Dune... (Attempt {i+1}/15)")
             status_res = requests.get(f"https://api.dune.com/api/v1/execution/{execution_id}/results", headers=headers)
             data = status_res.json()
-            if data.get("state") == "QUERY_STATE_COMPLETED": return data.get("result", {}).get("rows", [])
-            if data.get("state") in ["QUERY_STATE_FAILED", "QUERY_STATE_CANCELLED"]: return None
-    except Exception as e: logger.error(f"Dune API Error: {e}")
+            state = data.get("state")
+            
+            logger.info(f"Dune query state: {state}")
+            if state == "QUERY_STATE_COMPLETED": 
+                rows = data.get("result", {}).get("rows", [])
+                logger.info(f"Dune returned {len(rows)} result rows successfully.")
+                logger.debug(f"Raw Row Data: {rows}")
+                return rows
+            if state in ["QUERY_STATE_FAILED", "QUERY_STATE_CANCELLED"]: 
+                logger.error(f"Dune Query Failed on server: {data}")
+                return None
+    except Exception as e: 
+        logger.error(f"Local Exception during Dune API execution: {e}")
     return None
 
 async def is_ppp_holder(wallet_address: str) -> bool:
@@ -232,11 +258,22 @@ async def sync_historical_data(wallet_address: str):
 
 async def sync_via_helius(wallet_address: str):
     """Fallback: Scans last 100 enriched transactions via Helius + Holder Check"""
-    if not HELIUS_API_KEY: return await basic_rpc_scan(wallet_address)
+    logger.info("--- STARTING HELIUS RPC FALLBACK ---")
+    if not HELIUS_API_KEY: 
+        logger.warning("No Helius API key, resorting to basic RPC.")
+        return await basic_rpc_scan(wallet_address)
     
     url = f"https://api.helius.xyz/v0/addresses/{wallet_address}/transactions?api-key={HELIUS_API_KEY}"
     try:
-        txs = requests.get(url).json()
+        logger.info(f"Fetching txs from Helius: {url}")
+        res = requests.get(url)
+        if res.status_code != 200:
+            logger.error(f"Helius returned status {res.status_code}: {res.text}")
+            return {"status": "error", "message": "Helius scan failed"}
+            
+        txs = res.json()
+        logger.info(f"Helius returned {len(txs)} enriched transactions.")
+        
         metrics = {"DCA": 0.0, "Perps": 0.0, "Jup_Lend": 0.0, "Limit_Orders": 0.0, "PPP_Volume": 0.0, "Jup_Staked": 0.0}
         for tx in txs:
             desc = tx.get("description", "").lower()
@@ -246,6 +283,8 @@ async def sync_via_helius(wallet_address: str):
             elif "swap" in desc:
                 for t in tx.get("tokenTransfers", []):
                     if t.get("fromUserAccount") == wallet_address: metrics["PPP_Volume"] += t.get("tokenAmount", 0)
+        
+        logger.info(f"Metrics mapped from Helius: {metrics}")
         
         is_holder = await is_ppp_holder(wallet_address)
         multiplier = 1.5 if is_holder else 1.0
