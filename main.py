@@ -107,8 +107,8 @@ DUNE_API_KEY = os.getenv("DUNE_API_KEY", "")
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
 PPP_MINT_ADDRESS = os.getenv("PPP_MINT_ADDRESS", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 
-async def run_dune_query(query_sql: str):
-    """Executes a Dune SQL query and yields progress logs."""
+async def run_dune_query(wallet_address: str):
+    """Executes a parameterized Dune SQL query and yields progress logs."""
     yield {"type": "log", "message": "--- STARTING DUNE QUERY ENGINE ---"}
     if not DUNE_API_KEY:
         yield {"type": "log", "message": "DUNE_API_KEY is missing! Cannot run query."}
@@ -116,9 +116,17 @@ async def run_dune_query(query_sql: str):
         return
         
     headers = {"X-Dune-API-Key": DUNE_API_KEY}
+    QUERY_ID = 6830102
+    
     try:
-        yield {"type": "log", "message": "Sending query to Dune API..."}
-        execute_res = requests.post("https://api.dune.com/api/v1/query/execute", headers=headers, json={"query_sql": query_sql})
+        yield {"type": "log", "message": f"Triggering pre-saved Dune Query {QUERY_ID} for {wallet_address}..."}
+        
+        # Trigger query execution with parameters
+        execute_res = requests.post(
+            f"https://api.dune.com/api/v1/query/{QUERY_ID}/execute", 
+            headers=headers, 
+            json={"query_parameters": {"wallet_address": wallet_address}}
+        )
         
         if execute_res.status_code != 200:
             yield {"type": "log", "message": f"Dune API returned error code {execute_res.status_code}: {execute_res.text}"}
@@ -187,42 +195,8 @@ async def sync_historical_data(wallet_address: str):
 
         yield log(f"Starting Multi-Layer Sync for {wallet_address}...")
         
-        dune_sql = f"""
-        WITH swaps AS (
-            SELECT 'PPP_Volume' as metric, SUM(amount_usd) as val
-            FROM jupiter_solana.aggregator_swaps
-            WHERE trader_id = '{wallet_address}'
-        ),
-        perps AS (
-            SELECT 'Perps' as metric, SUM(amount_usd) as val
-            FROM jupiter_perps_solana.trades
-            WHERE trader = '{wallet_address}'
-        ),
-        dca AS (
-            SELECT 'DCA' as metric, SUM(amount_usd) as val
-            FROM jupiter_solana.aggregator_swaps
-            WHERE trader_id = '{wallet_address}'
-            AND (description LIKE '%DCA%' OR lower(source) LIKE '%dca%')
-        ),
-        staking AS (
-            SELECT 'Jup_Staked' as metric, SUM(amount) / 1e6 as val
-            FROM jupiter_solana.voting_locker_deposits
-            WHERE owner = '{wallet_address}'
-        ),
-        lend AS (
-            SELECT 'Jup_Lend' as metric, SUM(amount_usd) as val
-            FROM kamino_solana.deposits
-            WHERE owner = '{wallet_address}'
-        )
-        SELECT * FROM swaps 
-        UNION ALL SELECT * FROM perps 
-        UNION ALL SELECT * FROM dca
-        UNION ALL SELECT * FROM staking
-        UNION ALL SELECT * FROM lend
-        """
-        
         dune_results = None
-        async for chunk in run_dune_query(dune_sql):
+        async for chunk in run_dune_query(wallet_address):
             if chunk["type"] == "log":
                 yield log(chunk["message"])
             elif chunk["type"] == "result":
